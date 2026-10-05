@@ -237,6 +237,85 @@ def test_premature_last_section_clear_faults(conn, yard):
     assert all(l["instance_id"] == snap["instances"][-1]["id"] for l in snap["locks"])
 
 
+def test_last_clear_with_uncleared_front_sections_faults(conn, yard):
+    """末段按序出清，但前段仍由本实例锁定且实际占用 => 故障锁闭，保留全部锁。
+
+    模拟长列车/车组：D0 始终未出清（S0 释放条件始终不满足），其余段按序
+    推进到末段 S3 出清。旧实现仅凭末段已按序占用即删除全部锁并标记完成，
+    导致仍占用 S0 的情况下冲突进路可被放行。
+    """
+    il.request_route(conn, "R-MAIN")
+    seq = 1
+    # S0 占用，永不出清
+    il.report_event(conn, ev(seq, "D0", "occupy")); seq += 1
+    # S1 占用：S0 仍占用，S0 锁保留；S1 再出清时后继 S2 未占用 => 等待
+    il.report_event(conn, ev(seq, "D1", "occupy")); seq += 1
+    il.report_event(conn, ev(seq, "D1", "clear")); seq += 1
+    # S2 占用：S1 已出清 => 释放 S1 锁；S0 仍占用 => S0 锁保留
+    il.report_event(conn, ev(seq, "D2", "occupy")); seq += 1
+    il.report_event(conn, ev(seq, "D2", "clear")); seq += 1
+    # S3（末段）占用：S2 已出清 => 释放 S2 锁；S0 锁仍在
+    il.report_event(conn, ev(seq, "D3", "occupy")); seq += 1
+    snap = il.snapshot(conn)
+    assert any(l["resource_id"] == "S0" and l["route_id"] == "R-MAIN" for l in snap["locks"])
+    # 末段出清：S0 仍由本实例锁定且占用 => 故障锁闭，不得完成
+    r = il.report_event(conn, ev(seq, "D3", "clear"))
+    assert r["processed"][0]["fault"] is True
+    assert r["processed"][0]["state"]["event"] == "fault"
+    assert r["processed"][0]["state"]["uncleared_sections"] == ["S0"]
+    snap = il.snapshot(conn)
+    inst = snap["instances"][-1]
+    assert inst["status"] == "faulted"
+    assert inst["final_cleared"] is False
+    # 区段（S0、末段 S3）、道岔、侧防锁全部保留
+    held = {l["resource_id"]: l for l in snap["locks"] if l["instance_id"] == inst["id"]}
+    assert "S0" in held and "S3" in held
+    assert "SW1" in held and "SW2" in held
+    assert "FP-EAST" in held and "FP-WEST" in held
+    # 冲突进路不得放行（共用区段被故障实例锁/占用）
+    assert il.request_route(conn, "R-SIDING")["decision"] == "denied"
+    # 全段空闲前不得复位
+    with pytest.raises(il.ClientError) as ei:
+        il.reset_instance(conn, inst["id"])
+    assert ei.value.code == "reset_blocked"
+    # S0 出清（外部检测，不推进故障实例）后可人工复位
+    il.report_event(conn, ev(seq + 1, "D0", "clear"))
+    res = il.reset_instance(conn, inst["id"])
+    assert res["reset"] is True
+    snap = il.snapshot(conn)
+    assert snap["instances"][-1]["status"] == "completed"
+    assert [l for l in snap["locks"] if l["instance_id"] == inst["id"]] == []
+    # 复位后冲突进路可正常放行
+    assert il.request_route(conn, "R-SIDING")["decision"] == "permitted"
+
+
+def test_reoccupied_released_section_not_fault_on_completion(conn, yard):
+    """已合法释放的前段之后被外部检测再次报占用，末段出清不得误判本实例故障。"""
+    il.request_route(conn, "R-MAIN")
+    seq = 1
+    # 正常逐段推进：S0 出清并在 S1 占用时合法释放
+    il.report_event(conn, ev(seq, "D0", "occupy")); seq += 1
+    il.report_event(conn, ev(seq, "D0", "clear")); seq += 1
+    il.report_event(conn, ev(seq, "D1", "occupy")); seq += 1  # S0 锁在此释放
+    # 外部再次占用 S0：本实例已无 S0 锁，仅更新全站占用，不故障
+    r = il.report_event(conn, ev(seq, "D0", "occupy")); seq += 1
+    assert r["processed"][0]["fault"] is False
+    assert r["processed"][0]["state"]["event"] == "external_occupy"
+    # 继续推进到末段出清
+    il.report_event(conn, ev(seq, "D1", "clear")); seq += 1
+    il.report_event(conn, ev(seq, "D2", "occupy")); seq += 1
+    il.report_event(conn, ev(seq, "D2", "clear")); seq += 1
+    il.report_event(conn, ev(seq, "D3", "occupy")); seq += 1
+    r = il.report_event(conn, ev(seq, "D3", "clear"))
+    assert r["processed"][0]["fault"] is False
+    assert r["processed"][0]["state"]["event"] == "complete"
+    snap = il.snapshot(conn)
+    assert snap["instances"][-1]["status"] == "completed"
+    # 进路锁全解；S0 的外部占用独立保留在 occupancy 中
+    assert [l for l in snap["locks"] if l["route_id"] == "R-MAIN"] == []
+    assert snap["occupancy"]["S0"] is True
+
+
 # ---------------- 只增与重启 ----------------
 def test_logs_are_immutable(conn, yard):
     il.request_route(conn, "R-MAIN")

@@ -9,6 +9,10 @@
   共用任一资源的进路互斥；成功后锁定全部资源并建立进路实例。
 * 列车按进路顺序逐段占用；仅当后继段确认占用后本段方可出清释放。
 * 道岔与侧防锁定到末段出清（无论中间段释放顺序）。
+* 末段出清不是当然完成：须结合实例位置、锁归属与当前占用复核——仍由本实例
+  持锁且当前占用的前段即为未出清段，此时故障锁闭并保留全部锁闭，待全段空闲
+  后人工复位；已合法释放段（锁已不在本实例名下）即使被外部再次报占用，也不
+  计为本实例故障，不阻止进路完成。
 * 检测序号从 1 连续：缺号时报文缓冲，禁止新放行与解锁；缓冲按序补处理。
 * 同序同内容幂等返回原裁决；同序异内容拒绝。
 * 越序占用/出清使相关进路故障锁闭；故障复位须确认全段空闲。
@@ -636,28 +640,78 @@ def _process_one(
                 is_last = idx == len(rd["sections"]) - 1
                 if idx <= owner["position"]:
                     # 本段已按序占用：
-                    # 末段出清即列车离开，释放全部剩余锁闭（道岔/侧防/末段），进路完成；
                     # idx < position（后继段已确认占用）时出清即释放本段；
-                    # idx == position 且非末段时后继未占用，本段保持锁闭等待。
+                    # idx == position 且非末段时后继未占用，本段保持锁闭等待；
+                    # 末段出清须先按“实例位置 + 锁归属 + 当前占用”复核前段，
+                    # 防止前段仍占用时误删全部锁闭、误判进路完成。
                     if is_last:
-                        conn.execute(
-                            "DELETE FROM locks WHERE yard_id=? AND instance_id=?",
-                            (yard_id, owner["id"]),
-                        )
-                        conn.execute(
-                            "UPDATE instances SET status='completed', final_cleared=1 WHERE id=?",
-                            (owner["id"],),
-                        )
-                        _add_decision(
-                            conn,
-                            "complete",
-                            f"进路 {owner['route_id']}（实例 #{owner['id']}）末段出清，进路完成",
-                            {"seq": seq, "last_section": section_id},
-                            ref=str(seq),
-                            route_id=owner["route_id"],
-                            instance_id=owner["id"],
-                        )
-                        state.update({"event": "complete", "index": idx, "instance_id": owner["id"]})
+                        # position 已推进到末段；仍由本实例持锁的前段即“未到释放
+                        # 条件”的段（后继占用时它尚未出清，故锁被保留）。
+                        held_rows = conn.execute(
+                            f"SELECT resource_id FROM locks WHERE yard_id=? "
+                            f"AND resource_type='section' AND instance_id=? "
+                            f"AND resource_id IN ({','.join('?' * len(rd['sections']))})",
+                            (yard_id, owner["id"], *rd["sections"]),
+                        ).fetchall()
+                        held_prev = [r["resource_id"] for r in held_rows if r["resource_id"] != section_id]
+                        if held_prev:
+                            occ_rows = conn.execute(
+                                f"SELECT section_id FROM occupancy WHERE yard_id=? "
+                                f"AND occupied=1 AND section_id IN "
+                                f"({','.join('?' * len(held_prev))})",
+                                (yard_id, *held_prev),
+                            ).fetchall()
+                            uncleared = [r["section_id"] for r in occ_rows]
+                        else:
+                            uncleared = []
+                        if uncleared:
+                            # 前段仍属本实例（锁未释放）且实际占用：列车/车组未出清，
+                            # 末段出清不能完成进路。故障锁闭，保留全部区段、道岔、
+                            # 侧防锁，阻止冲突进路放行，待全段空闲后人工复位。
+                            fault = True
+                            fault_reason = (
+                                f"末段 {section_id} 已出清，但前段 {'、'.join(uncleared)} "
+                                "仍由本进路锁定且尚未出清，进路故障锁闭（保留全部锁闭，"
+                                "待全段空闲后人工复位）"
+                            )
+                            state.update({
+                                "event": "fault",
+                                "reason": fault_reason,
+                                "index": idx,
+                                "position": owner["position"],
+                                "uncleared_sections": uncleared,
+                                "note": "已合法释放段的外部再占用不在此列（无本实例锁归属）",
+                            })
+                            _fault_instance(conn, owner, fault_reason, {
+                                "seq": seq,
+                                "section": section_id,
+                                "kind": "clear",
+                                "index": idx,
+                                "position": owner["position"],
+                                "uncleared_sections": uncleared,
+                            })
+                        else:
+                            # 本实例仍持锁的前段均已空闲：列车离开，释放全部剩余
+                            # 锁闭（道岔/侧防/末段），进路完成。已合法释放段即使
+                            # 被外部检测再次报占用，因无本实例锁归属而不影响完成。
+                            conn.execute(
+                                "DELETE FROM locks WHERE yard_id=? AND instance_id=?",
+                                (yard_id, owner["id"]),
+                            )
+                            conn.execute(
+                                "UPDATE instances SET status='completed', final_cleared=1 WHERE id=?",
+                                (owner["id"],),
+                            )
+                            _add_decision(
+                                conn,
+                                "complete",
+                                f"进路 {owner['route_id']}（实例 #{owner['id']}）末段出清，进路完成",
+                                {"seq": seq, "last_section": section_id},
+                                ref=str(seq),
+                                route_id=owner["route_id"],
+                                instance_id=owner["id"],
+                            )
+                            state.update({"event": "complete", "index": idx, "instance_id": owner["id"]})
                     elif idx < owner["position"]:
                         conn.execute(
                             "DELETE FROM locks WHERE yard_id=? AND resource_type='section' "
