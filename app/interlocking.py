@@ -8,7 +8,9 @@
 * 放行事务：核对进路每段“已知空闲”、道岔/侧防/区段均未被其他进路锁定，
   共用任一资源的进路互斥；成功后锁定全部资源并建立进路实例。
 * 列车按进路顺序逐段占用；仅当后继段确认占用后本段方可出清释放。
-* 道岔与侧防锁定到末段出清（无论中间段释放顺序）。
+* 道岔与侧防锁定到末段出清；但末段出清须裁决前段：锁仍归本实例且当前
+  占用的前段未出清 -> 故障锁闭并保留全部锁，待全段空闲后人工复位；锁已合法
+  释放后由外部再次占用的前段不属本实例故障，进路正常完成。
 * 检测序号从 1 连续：缺号时报文缓冲，禁止新放行与解锁；缓冲按序补处理。
 * 同序同内容幂等返回原裁决；同序异内容拒绝。
 * 越序占用/出清使相关进路故障锁闭；故障复位须确认全段空闲。
@@ -636,28 +638,89 @@ def _process_one(
                 is_last = idx == len(rd["sections"]) - 1
                 if idx <= owner["position"]:
                     # 本段已按序占用：
-                    # 末段出清即列车离开，释放全部剩余锁闭（道岔/侧防/末段），进路完成；
                     # idx < position（后继段已确认占用）时出清即释放本段；
-                    # idx == position 且非末段时后继未占用，本段保持锁闭等待。
+                    # idx == position 且非末段时后继未占用，本段保持锁闭等待；
+                    # idx == position 且为末段时，须先裁决前段再决定完成或故障锁闭。
                     if is_last:
-                        conn.execute(
-                            "DELETE FROM locks WHERE yard_id=? AND instance_id=?",
-                            (yard_id, owner["id"]),
-                        )
-                        conn.execute(
-                            "UPDATE instances SET status='completed', final_cleared=1 WHERE id=?",
-                            (owner["id"],),
-                        )
-                        _add_decision(
-                            conn,
-                            "complete",
-                            f"进路 {owner['route_id']}（实例 #{owner['id']}）末段出清，进路完成",
-                            {"seq": seq, "last_section": section_id},
-                            ref=str(seq),
-                            route_id=owner["route_id"],
-                            instance_id=owner["id"],
-                        )
-                        state.update({"event": "complete", "index": idx, "instance_id": owner["id"]})
+                        # 裁决前段：结合实例位置、锁归属与当前占用。
+                        # lingering = 前段锁仍归本实例（未到释放条件）且当前仍占用：
+                        #   该段仍属本实例且尚未出清，末段出清不得判为完成，
+                        #   故障锁闭并保留全部锁（区段/道岔/侧防），阻止冲突进路放行，
+                        #   待全段空闲后人工复位。
+                        # external = 前段当前占用、但其锁已不在本实例（已合法释放后
+                        #   由外部检测再次报占用）：不属本实例故障，正常完成。
+                        front = rd["sections"][:idx]
+                        lingering: list[str] = []
+                        external: list[str] = []
+                        if front:
+                            placeholders = ",".join("?" * len(front))
+                            held = {
+                                r["resource_id"]
+                                for r in conn.execute(
+                                    f"SELECT resource_id FROM locks WHERE yard_id=? "
+                                    f"AND resource_type='section' AND instance_id=? "
+                                    f"AND resource_id IN ({placeholders})",
+                                    (yard_id, owner["id"], *front),
+                                ).fetchall()
+                            }
+                            occ_rows = conn.execute(
+                                f"SELECT section_id FROM occupancy WHERE yard_id=? AND occupied=1 "
+                                f"AND section_id IN ({placeholders})",
+                                (yard_id, *front),
+                            ).fetchall()
+                            for r in occ_rows:
+                                (lingering if r["section_id"] in held else external).append(
+                                    r["section_id"]
+                                )
+                        if lingering:
+                            fault = True
+                            fault_reason = (
+                                f"末段 {section_id} 已出清但前段 {'、'.join(lingering)} "
+                                f"仍由本实例锁闭且占用（未出清），故障锁闭"
+                            )
+                            state.update({
+                                "event": "fault",
+                                "reason": fault_reason,
+                                "index": idx,
+                                "lingering": lingering,
+                                "external_occupied": external,
+                                "note": "保留全部锁闭，待全段空闲后人工复位",
+                            })
+                            _fault_instance(conn, owner, fault_reason, {
+                                "seq": seq,
+                                "section": section_id,
+                                "kind": "clear",
+                                "index": idx,
+                                "lingering": lingering,
+                                "external_occupied": external,
+                            })
+                        else:
+                            # 无仍属本实例且未出清的前段：列车确已离开，释放全部剩余
+                            # 锁闭（道岔/侧防/末段），进路完成。已合法释放段的后续
+                            # 占用仅记录，不误判为本实例故障。
+                            conn.execute(
+                                "DELETE FROM locks WHERE yard_id=? AND instance_id=?",
+                                (yard_id, owner["id"]),
+                            )
+                            conn.execute(
+                                "UPDATE instances SET status='completed', final_cleared=1 WHERE id=?",
+                                (owner["id"],),
+                            )
+                            _add_decision(
+                                conn,
+                                "complete",
+                                f"进路 {owner['route_id']}（实例 #{owner['id']}）末段出清，进路完成",
+                                {"seq": seq, "last_section": section_id, "external_occupied": external},
+                                ref=str(seq),
+                                route_id=owner["route_id"],
+                                instance_id=owner["id"],
+                            )
+                            state.update({
+                                "event": "complete",
+                                "index": idx,
+                                "instance_id": owner["id"],
+                                "external_occupied": external,
+                            })
                     elif idx < owner["position"]:
                         conn.execute(
                             "DELETE FROM locks WHERE yard_id=? AND resource_type='section' "
